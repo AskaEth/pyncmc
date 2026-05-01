@@ -248,32 +248,41 @@ class NCMDecoder:
         return b''.join(decrypted_parts)
     
     def _parse_cover(self, data: bytes, offset: int) -> Tuple[Optional[bytes], int]:
-        """解析封面图片"""
+        """解析封面图片 — 兼容 NCM 裸格式(格式B)和盒装格式(格式A)"""
         if offset + 4 > len(data):
             return None, offset
-        
-        cover_frame_len = struct.unpack('<I', data[offset:offset+4])[0]
-        offset += 4
-        
-        if cover_frame_len <= 0:
-            return None, offset
-        
-        if offset + 4 > len(data):
-            return None, offset
-        
-        img_len = struct.unpack('<I', data[offset:offset+4])[0]
-        offset += 4
-        
-        cover_data = None
-        if img_len > 0 and offset + img_len <= len(data):
-            cover_data = data[offset:offset+img_len]
-            offset += img_len
-        
-        remaining = cover_frame_len - img_len - 4
-        if remaining > 0 and offset + remaining <= len(data):
-            offset += remaining
-        
-        return cover_data, offset
+
+        first_field = struct.unpack('<I', data[offset:offset + 4])[0]
+
+        # 字段为 0 → 无封面
+        if first_field <= 0:
+            return None, offset + 4
+
+        # ── 格式 B（裸/单层，最常见）：first_field = 图片大小 ──
+        # 图片数据紧跟在 4 字节长度后，以 JPEG 魔数 FF D8 开头
+        img_start_b = offset + 4
+        if first_field <= 10 * 1024 * 1024 and img_start_b + first_field <= len(data):
+            candidate = data[img_start_b:img_start_b + first_field]
+            if candidate[:2] == b'\xff\xd8':
+                return candidate, img_start_b + first_field
+
+        # ── 格式 A（盒装/双层）：first_field = 外盒大小 ──
+        # 结构: [box_size][img_size][JPEG][padding]
+        img_start_a = offset + 8
+        if first_field >= 8 and offset + 4 + first_field <= len(data):
+            inner_img_len = struct.unpack('<I', data[offset + 4:offset + 8])[0]
+            if 0 < inner_img_len <= first_field - 4:
+                if img_start_a + inner_img_len <= len(data):
+                    candidate = data[img_start_a:img_start_a + inner_img_len]
+                    if candidate[:2] == b'\xff\xd8':
+                        return candidate, offset + 4 + first_field
+
+        # ── 兜底 ──
+        if 0 < first_field <= 10 * 1024 * 1024:
+            return None, offset + 4 + first_field
+        else:
+            return None, offset + 4
+
     
     def decode(self) -> Tuple[bytes, str, dict]:
         """解码 NCM 文件"""
@@ -325,10 +334,11 @@ class NCMDecoder:
         meta_consumed = self.metadata_parser.parse(data, offset)
         offset += meta_consumed
         self.metadata = self.metadata_parser.metadata
-        
-        if offset + 5 <= file_size:
-            offset += 5
-        
+
+        # 跳过 CRC32 (4字节) + 分隔符 (5字节) = 共 9 字节
+        if offset + 9 <= file_size:
+            offset += 9
+
         cover_data, offset = self._parse_cover(data, offset)
         if cover_data:
             self.cover_data = cover_data
@@ -342,7 +352,10 @@ class NCMDecoder:
         
         if decrypted_audio[0:4] == b'fLaC':
             self.audio_format = 'flac'
+        elif decrypted_audio[0:2] == b'\xff\xfb' or decrypted_audio[0:1] == b'\xff':
+            self.audio_format = 'mp3'
         else:
+            logging.warning(f"未知音频格式，前4字节: {decrypted_audio[:4].hex()}，假定为 mp3")
             self.audio_format = 'mp3'
         
         info = {
@@ -355,17 +368,16 @@ class NCMDecoder:
         return decrypted_audio, self.audio_format, info
     
     def embed_metadata(self, audio_data: bytes, audio_format: str, output_path: Path):
-        """将元数据嵌入音频文件"""
         if not MUTAGEN_AVAILABLE:
             with open(output_path, 'wb') as f:
                 f.write(audio_data)
             return
-        
+
+        temp_path = output_path.with_suffix(output_path.suffix + '.tmp')
         try:
-            temp_path = output_path.with_suffix(output_path.suffix + '.tmp')
             with open(temp_path, 'wb') as f:
                 f.write(audio_data)
-            
+
             if audio_format == 'flac':
                 self._embed_flac_metadata(temp_path, output_path)
             elif audio_format == 'mp3':
@@ -374,14 +386,15 @@ class NCMDecoder:
                 self._embed_m4a_metadata(temp_path, output_path)
             else:
                 shutil.copy2(temp_path, output_path)
-            
-            if temp_path.exists():
-                temp_path.unlink()
-                
+
         except Exception as e:
             logging.warning(f"嵌入元数据失败：{e}，保存原始文件")
             with open(output_path, 'wb') as f:
                 f.write(audio_data)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+
     
     def _embed_flac_metadata(self, temp_path: Path, output_path: Path):
         """嵌入 FLAC 元数据 (Vorbis Comments)"""
@@ -547,19 +560,60 @@ class FileProcessor:
             print(f"错误：源目录不存在：{self.source_dir}")
     
     def _setup_logging(self) -> logging.Logger:
-        logger = logging.getLogger('MusicConverter')
-        logger.setLevel(getattr(logging, self.config.get('log_level', 'INFO').upper()))
-        logger.handlers = []
-        
-        file_handler = logging.FileHandler(self.config.get('log_file', 'music_converter.log'), encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(file_handler)
-        
+        """设置日志系统：logs/时间戳.log，自动轮转保留最近20个"""
+        # 在项目目录下创建 logs/ 文件夹
+        logs_dir = Path(__file__).resolve().parent / 'logs'
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # 清理旧日志，保留最多 19 个（ + 本次新建的 = 20 个）
+        self._rotate_logs(logs_dir, max_files=19)
+
+        # 以时间为文件名
+        timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        log_file = logs_dir / f'{timestamp}.log'
+
+        # 配置根 logger，使所有模块的日志都汇聚到文件
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.handlers.clear()
+
+        # 文件 handler — 记录所有级别
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)-7s] %(message)s',
+            datefmt='%H:%M:%S'
+        ))
+        root_logger.addHandler(file_handler)
+
+        # 控制台 handler — 只显示 INFO 及以上
         console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
-        logger.addHandler(console_handler)
-        
+        root_logger.addHandler(console_handler)
+
+        logger = logging.getLogger('MusicConverter')
+        logger.info(f'日志文件：{log_file}')
+        logger.info(f'源目录：{self.source_dir}')
+        logger.info(f'目标目录：{self.target_dir}')
+        logger.info(f'并行线程：{self.config.get("threads", 2)}'
+                    f' / 解码线程：{self.config.get("decode_threads", 8)}')
+
         return logger
+
+    def _rotate_logs(self, logs_dir: Path, max_files: int = 19):
+        """保持日志文件数量不超过 max_files"""
+        log_files = sorted(
+            logs_dir.glob('*.log'),
+            key=lambda p: p.stat().st_mtime
+        )
+        while len(log_files) > max_files:
+            oldest = log_files.pop(0)
+            try:
+                oldest.unlink()
+            except Exception:
+                pass
+
     
     def _load_processed_cache(self) -> Set[str]:
         cache_file = self.target_dir / '.processed_cache.json'
@@ -578,6 +632,52 @@ class FileProcessor:
                 json.dump(list(self.processed_cache), f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.logger.warning(f"无法保存缓存：{e}")
+
+    def _cleanup_tmp_files(self):
+        tmp_files = list(self.target_dir.glob("*.tmp"))
+        if not tmp_files:
+            return
+
+        self.logger.info(f"检查残留 .tmp 文件：发现 {len(tmp_files)} 个")
+        orphan_tmp_files = []
+
+        for tmp_file in tmp_files:
+            expected_file = self.target_dir / tmp_file.stem
+
+            if expected_file.exists():
+                try:
+                    tmp_file.unlink()
+                    self.logger.info(f"已清理残留临时文件：{tmp_file.name}（{expected_file.name} 已存在）")
+                except Exception as e:
+                    self.logger.warning(f"无法删除临时文件 {tmp_file.name}：{e}")
+            else:
+                orphan_tmp_files.append(tmp_file)
+
+        for tmp_file in orphan_tmp_files:
+            self.logger.warning(f"发现孤立临时文件：{tmp_file.name}（对应的 {tmp_file.stem} 不存在）")
+            print(f"\n⚠ 警告：发现孤立临时文件 {tmp_file.name}，对应的解码文件不存在")
+
+            while True:
+                try:
+                    answer = input(f"  是否删除？[y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("  已跳过（无交互输入）")
+                    break
+
+                if answer in ('', 'n', 'N', 'no'):
+                    print(f"  已保留：{tmp_file.name}")
+                    break
+                elif answer in ('y', 'Y', 'yes'):
+                    try:
+                        tmp_file.unlink()
+                        self.logger.info(f"已删除孤立临时文件：{tmp_file.name}")
+                        print(f"  已删除：{tmp_file.name}")
+                    except Exception as e:
+                        self.logger.error(f"无法删除 {tmp_file.name}：{e}")
+                        print(f"  删除失败：{e}")
+                    break
+                else:
+                    print("  请输入 y 或 n")
     
     def _get_file_signature(self, file_path: Path) -> str:
         try:
@@ -609,20 +709,53 @@ class FileProcessor:
         try:
             target_file = self.target_dir / source_file.name
             if target_file.exists() and target_file.stat().st_mtime > source_file.stat().st_mtime:
-                self.logger.info(f"跳过：{source_file.name}")
+                self.logger.info(f"跳过（已存在）：{source_file.name}")
                 return True
-            
+
             shutil.copy2(source_file, target_file)
-            self.logger.info(f"已复制：{source_file.name}")
-            
+
+            # ── 提取元数据用于日志 ──
+            file_size_mb = source_file.stat().st_size / 1024 / 1024
+            meta_parts = [f"{file_size_mb:.2f}MB"]
+
+            if MUTAGEN_AVAILABLE:
+                try:
+                    info = mutagen.File(target_file, easy=True)
+                    if info:
+                        if 'title' in info:
+                            meta_parts.append(f"标题：{info['title'][0]}")
+                        if 'artist' in info:
+                            meta_parts.append(f"艺人：{info['artist'][0]}")
+                        if 'length' in info and info['length']:
+                            meta_parts.append(f"时长：{info['length']:.1f}s")
+                        # FLAC / MP3 的比特率
+                        bitrate = getattr(info.info, 'bitrate', 0)
+                        if bitrate:
+                            meta_parts.append(f"{bitrate // 1000}kbps")
+                        # 采样率 / 声道
+                        sample_rate = getattr(info.info, 'sample_rate', 0)
+                        channels = getattr(info.info, 'channels', 0)
+                        if sample_rate:
+                            sr_str = f"{sample_rate / 1000:.1f}kHz"
+                            if channels:
+                                sr_str += f"/{channels}ch"
+                            meta_parts.append(sr_str)
+                except Exception:
+                    pass
+
+            self.logger.info(
+                f"已复制：{source_file.name}（{'，'.join(meta_parts)}）"
+            )
+
             file_sig = self._get_file_signature(source_file)
             if file_sig:
                 self.processed_cache.add(file_sig)
-            
+
             return True
         except Exception as e:
             self.logger.error(f"复制失败 {source_file}: {e}")
             return False
+
     
     def _convert_ncm_file(self, source_file: Path) -> bool:
         try:
@@ -705,7 +838,9 @@ class FileProcessor:
             for file_path in audio_files:
                 if self._is_already_processed(file_path):
                     skip_count += 1
+                    self.logger.info(f"跳过（已处理）：{file_path.name}")
                     continue
+
                 
                 if file_path.suffix.lower() == '.ncm':
                     future = executor.submit(self._convert_ncm_file, file_path)
@@ -727,7 +862,7 @@ class FileProcessor:
         self.logger.info(f"完成：成功 {success_count}, 失败 {fail_count}, 跳过 {skip_count}")
         print(f"完成：成功 {success_count}, 失败 {fail_count}, 跳过 {skip_count}")
         self._save_processed_cache()
-
+        self._cleanup_tmp_files()
 
 def main():
     print("=" * 60)
