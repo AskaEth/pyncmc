@@ -10,6 +10,7 @@ import sys
 import shutil
 import logging
 import configparser
+import argparse
 import struct
 import hashlib
 import time
@@ -17,7 +18,7 @@ import json
 import base64
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Set, Tuple, Optional
+from typing import Dict, Set, Tuple, Optional, List
 
 # 尝试导入加密库
 try:
@@ -535,28 +536,52 @@ def load_config(config_path: str = "music_converter.conf") -> Dict:
     return config
 
 
+def resolve_inputs(paths: List[str]) -> List[Path]:
+    """解析输入参数：文件直接加入，目录则扫描支持的文件"""
+    result = []
+    for p in paths:
+        path = Path(p).expanduser().resolve()
+        if path.is_file():
+            if path.suffix.lower() in SUPPORTED_AUDIO_EXT:
+                result.append(path)
+            else:
+                print(f"⚠ 不支持的文件格式，跳过：{path}")
+        elif path.is_dir():
+            found = []
+            for ext in SUPPORTED_AUDIO_EXT:
+                found.extend(path.glob(f"*{ext}"))
+                found.extend(path.glob(f"*{ext.upper()}"))
+            found.sort(key=lambda x: x.stat().st_mtime)
+            result.extend(found)
+        else:
+            print(f"⚠ 路径不存在，跳过：{path}")
+    return result
+
+
 class FileProcessor:
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, source_dir: Optional[Path] = None,
+                 target_dir: Optional[Path] = None):
         self.config = config
-        self.source_dir = Path(config['source_dir']).resolve()
-        self.target_dir = Path(config['target_dir']).resolve()
+        self.source_dir = source_dir or Path(config['source_dir']).resolve()
+        self.target_dir = target_dir or Path(config['target_dir']).resolve()
         self.logger = self._setup_logging()
-        
+        self._is_cli_mode = source_dir is not None or target_dir is not None
+
         self.target_dir.mkdir(parents=True, exist_ok=True)
         self.processed_cache = self._load_processed_cache()
-        
+
         print(f"源目录：{self.source_dir}")
         print(f"目标目录：{self.target_dir}")
         print(f"文件并行线程：{config['threads']}")
         print(f"单文件解码线程：{config['decode_threads']}")
         print(f"嵌入元数据：{config['embed_metadata']}")
-        
+
         if not MUTAGEN_AVAILABLE and config['embed_metadata']:
             print(f"⚠ 警告：embed_metadata=true 但 mutagen 不可用")
             print(f"  错误：{MUTAGEN_ERROR}")
             print(f"  尝试：pip install --upgrade mutagen")
-        
-        if not self.source_dir.exists():
+
+        if not self.source_dir.exists() and not source_dir:
             print(f"错误：源目录不存在：{self.source_dir}")
     
     def _setup_logging(self) -> logging.Logger:
@@ -823,32 +848,38 @@ class FileProcessor:
             audio_files.extend(self.source_dir.glob(f"*{ext.upper()}"))
         
         audio_files.sort(key=lambda x: x.stat().st_mtime)
+        return self._process_file_list(audio_files)
+
+    def process_files(self, file_list: List[Path]):
+        """处理指定文件列表（CLI 模式，不做跳过检测）"""
+        return self._process_file_list(file_list, skip_processed=False)
+
+    def _process_file_list(self, audio_files: List[Path], skip_processed: bool = True):
         self.logger.info(f"找到 {len(audio_files)} 个文件")
-        
+
         if not audio_files:
             print("没有需要处理的文件")
             return
-        
+
         max_workers = min(self.config.get('threads', 4), len(audio_files), 8)
         success_count = fail_count = skip_count = 0
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            
+
             for file_path in audio_files:
-                if self._is_already_processed(file_path):
+                if skip_processed and self._is_already_processed(file_path):
                     skip_count += 1
                     self.logger.info(f"跳过（已处理）：{file_path.name}")
                     continue
 
-                
                 if file_path.suffix.lower() == '.ncm':
                     future = executor.submit(self._convert_ncm_file, file_path)
                 else:
                     future = executor.submit(self._copy_audio_file, file_path)
-                
+
                 futures[future] = file_path
-            
+
             for future in as_completed(futures):
                 try:
                     if future.result():
@@ -858,13 +889,24 @@ class FileProcessor:
                 except Exception as e:
                     self.logger.error(f"任务异常：{e}")
                     fail_count += 1
-        
+
         self.logger.info(f"完成：成功 {success_count}, 失败 {fail_count}, 跳过 {skip_count}")
         print(f"完成：成功 {success_count}, 失败 {fail_count}, 跳过 {skip_count}")
-        self._save_processed_cache()
-        self._cleanup_tmp_files()
+        if skip_processed:
+            self._save_processed_cache()
+            self._cleanup_tmp_files()
 
-def main():
+def _is_likely_output_dir(path_str: str) -> bool:
+    """判断路径是否为输出目录（而非音频输入文件）"""
+    path = Path(path_str)
+    if path.is_dir():
+        return True
+    if not path.suffix or path.suffix.lower() not in SUPPORTED_AUDIO_EXT:
+        return True
+    return False
+
+
+def print_banner():
     print("=" * 60)
     print("音乐文件转换工具 - NCM 解码 // By YeiJ")
     print("功能：音频解码 + 元数据嵌入 + 封面嵌入")
@@ -876,27 +918,121 @@ def main():
         print(f"⚠ mutagen 不可用：{MUTAGEN_ERROR}")
         print("  安装命令：pip install --upgrade mutagen")
     print("=" * 60)
-    
-    config = load_config()
-    print(f"配置：{config}")
-    print("-" * 60)
-    
     if not CRYPTO_AVAILABLE:
         print("注意：需要 pycryptodome 库 (pip install pycryptodome)")
-    
-    try:
-        processor = FileProcessor(config)
-        processor.scan_and_process_files()
-        print("\n完成!")
-        return 0
-    except KeyboardInterrupt:
-        print("\n中断")
-        return 130
-    except Exception as e:
-        print(f"错误：{e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='音乐文件转换工具 - NCM 解码（支持单文件、多文件、文件夹、配置文件模式）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+使用示例：
+  python pyncmc.py                                 # 配置文件模式
+  python pyncmc.py song.ncm                        # 转换单个文件（输出到当前目录）
+  python pyncmc.py song.ncm ~/Music/               # 指定输出目录
+  python pyncmc.py a.ncm b.ncm                     # 转换多个文件
+  python pyncmc.py a.ncm b.ncm ~/Music/            # 多文件 + 输出目录
+  python pyncmc.py ./music_dir/                    # 转换整个文件夹
+  python pyncmc.py ./music_dir/ ~/Music/           # 文件夹 + 输出目录
+  python pyncmc.py "dir1" song.ncm ~/Music/        # 混合 + 输出目录
+  python pyncmc.py a.ncm -o ~/Music/               # -o 指定输出目录
+  python pyncmc.py song.ncm --no-meta              # 不嵌入元数据
+  python pyncmc.py song.ncm -t 8                   # 8 线程解码
+        ''')
+    parser.add_argument('inputs', nargs='*',
+                        help='输入文件（.ncm .flac .mp3 ...）或目录（留空则使用配置文件模式）')
+    parser.add_argument('-o', '--output', default=None,
+                        help='输出目录（默认：CLI模式下为当前目录，配置模式下使用配置文件）')
+    parser.add_argument('-t', '--threads', type=int, default=None,
+                        help=f'单文件解码线程数（默认：配置值或 4）')
+    parser.add_argument('-j', '--jobs', type=int, default=None,
+                        help=f'文件并行处理数（默认：配置值或 4）')
+    parser.add_argument('--no-meta', action='store_true',
+                        help='不嵌入元数据（标题、艺人、封面）')
+    parser.add_argument('-c', '--config', default='music_converter.conf',
+                        help=f'配置文件路径（默认：music_converter.conf）')
+
+    args = parser.parse_args()
+
+    print_banner()
+
+    result = 0
+
+    if args.inputs:
+        if args.output is None and len(args.inputs) >= 2:
+            last = args.inputs[-1]
+            if _is_likely_output_dir(last):
+                args.output = last
+                args.inputs = args.inputs[:-1]
+
+        if not args.inputs:
+            print("错误：没有输入文件")
+            return 1
+
+        file_list = resolve_inputs(args.inputs)
+        if not file_list:
+            print("错误：没有找到可处理的文件")
+            return 1
+
+        output_dir = args.output or str(Path.cwd())
+
+        cli_config = {
+            'source_dir': str(Path(args.inputs[0]).parent.resolve()),
+            'target_dir': output_dir,
+            'log_file': 'music_converter.log',
+            'log_level': 'INFO',
+            'threads': args.jobs or 4,
+            'decode_threads': args.threads or 4,
+            'embed_metadata': not args.no_meta,
+        }
+        config = cli_config
+
+        print(f"模式：命令行模式，共 {len(file_list)} 个文件")
+        print(f"输出目录：{output_dir}")
+        print(f"解码线程：{config['decode_threads']}")
+        print(f"元数据嵌入：{'否' if args.no_meta else '是'}")
+
+        try:
+            processor = FileProcessor(config,
+                                       source_dir=Path('.'),
+                                       target_dir=Path(output_dir))
+            processor.process_files(file_list)
+        except KeyboardInterrupt:
+            print("\n中断")
+            result = 130
+        except Exception as e:
+            print(f"错误：{e}")
+            import traceback
+            traceback.print_exc()
+            result = 1
+    else:
+        try:
+            config = load_config(args.config)
+            print(f"配置文件：{args.config}")
+            print(f"配置：{config}")
+            print("-" * 60)
+
+            if args.threads is not None:
+                config['decode_threads'] = args.threads
+            if args.jobs is not None:
+                config['threads'] = args.jobs
+            if args.no_meta:
+                config['embed_metadata'] = False
+
+            processor = FileProcessor(config)
+            processor.scan_and_process_files()
+            print("\n完成!")
+        except KeyboardInterrupt:
+            print("\n中断")
+            result = 130
+        except Exception as e:
+            print(f"错误：{e}")
+            import traceback
+            traceback.print_exc()
+            result = 1
+
+    return result
 
 
 if __name__ == "__main__":

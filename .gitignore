@@ -1,0 +1,4 @@
+__pycache__/
+logs/
+.processed_cache.json
+*.pyc
