@@ -12,6 +12,8 @@ import sys
 import json
 import base64
 import time
+import argparse
+import configparser
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 from datetime import datetime
@@ -649,14 +651,48 @@ def format_report(reports: List[FileReport], script_dir: Path) -> str:
 #  主入口
 # ═══════════════════════════════════════════════════════════════
 
+def load_analyzer_config(config_path: str) -> Dict[str, Any]:
+    """读取 [settings] 里的分析器设置；文件不存在时用默认值。"""
+    cfg: Dict[str, Any] = {'log_dir': 'logs', 'log_keep': 20}
+    path = Path(config_path)
+    if not path.exists():
+        return cfg
+    try:
+        parser = configparser.ConfigParser()
+        parser.optionxform = str
+        parser.read(path, encoding='utf-8')
+        if parser.has_section('settings'):
+            section = parser['settings']
+            if 'log_dir' in section and section['log_dir'].strip():
+                cfg['log_dir'] = section['log_dir'].strip()
+            if 'log_keep' in section:
+                try:
+                    cfg['log_keep'] = max(1, int(section['log_keep']))
+                except ValueError:
+                    pass
+    except Exception as e:
+        print(f'⚠ 配置文件读取失败（{e}），使用默认值')
+    return cfg
+
+
 def main():
-    if len(sys.argv) < 2:
-        print('用法：python analyze_ncm.py <文件.ncm 或 文件夹 或 文件1 文件2 ...>')
+    ap = argparse.ArgumentParser(
+        description='NCM 文件结构分析器',
+        epilog='示例：python analyze_ncm.py song.ncm /path/to/ncm_dir -c my.conf')
+    ap.add_argument('paths', nargs='*', help='文件或文件夹（可多个）')
+    ap.add_argument('-c', '--config', default='music_converter.conf',
+                    help='配置文件路径（默认 music_converter.conf）')
+    parsed = ap.parse_args()
+
+    if not parsed.paths:
+        print('用法：python analyze_ncm.py <文件.ncm 或 文件夹 或 文件1 文件2 ...> [-c 配置文件]')
         sys.exit(1)
+
+    cfg = load_analyzer_config(parsed.config)
 
     # 收集文件
     ncm_files: List[Path] = []
-    args = [Path(a) for a in sys.argv[1:]]
+    args = [Path(a) for a in parsed.paths]
 
     for arg in args:
         if not arg.exists():
@@ -715,16 +751,18 @@ def main():
         print(line)
 
     # ── 保存日志 ──
-    log_dir = script_dir / 'logs'
+    log_dir = Path(cfg['log_dir'])
+    if not log_dir.is_absolute():
+        log_dir = script_dir / log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_file = log_dir / f'analysis_{timestamp}.log'
     log_file.write_text(strip_ansi(report_text), encoding='utf-8')
     print(f'\n{c("分析报告已保存到：", Color.CYAN)} {log_file}')
 
-    # 清理旧日志（保留最近 20 个）
+    # 清理旧日志（默认保留最近 20 个，可用 log_keep 调整）
     log_files = sorted(log_dir.glob('analysis_*.log'), key=lambda p: p.stat().st_mtime)
-    while len(log_files) > 20:
+    while len(log_files) > cfg['log_keep']:
         try:
             log_files.pop(0).unlink()
         except Exception:

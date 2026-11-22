@@ -54,6 +54,9 @@ python pyncmc.py song.ncm --keep-padding
 
 # 自定义线程数
 python pyncmc.py song.ncm -t 8 -j 4
+
+# 指定非标准配置文件（CLI 模式也会读取其中的默认值，命令行参数优先）
+python pyncmc.py song.ncm -o ~/Music/ -c my_settings.conf
 ```
 
 ### 配置文件模式
@@ -89,7 +92,7 @@ log_level = INFO
 | `-j`, `--jobs` | 文件并行处理数（默认 4） |
 | `--no-meta` | 不嵌入元数据 |
 | `--keep-padding` | 保留 FLAC 的 `PADDING` 填充块（默认剔除；块体为全零，仅用于对齐文件大小）|
-| `-c`, `--config` | 配置文件路径（默认 music_converter.conf） |
+| `-c`, `--config` | 配置文件路径（默认 `music_converter.conf`；CLI 模式也会读它，命令行参数优先）|
 
 ---
 
@@ -104,4 +107,19 @@ python analyze_ncm.py "ncm 所在文件夹"
 
 # 多个指定文件
 python analyze_ncm.py "a.ncm" "b.ncm" "c.ncm"
+
+# 指定配置文件（可选）
+python analyze_ncm.py "a.ncm" -c my_settings.conf
 ```
+
+配置文件与 pyncmc 共用同一个 ini，只读取分析相关的键：
+
+```ini
+[settings]
+# 报告目录；相对路径按脚本所在目录解析
+log_dir = logs
+# 保留最近多少份报告
+log_keep = 20
+```
+
+缺省时使用 `logs/` 与 20 份；配置文件不存在时直接回落默认值。

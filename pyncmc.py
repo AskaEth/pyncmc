@@ -1116,21 +1116,33 @@ def main():
 
         output_dir = args.output or str(Path.cwd())
 
+        # 命令行模式同样复用配置文件里的默认值（-c 可指定非标准文件名）
+        file_cfg = {}
+        if Path(args.config).exists():
+            try:
+                file_cfg = load_config(args.config)
+            except Exception as e:
+                print(f"警告：配置文件读取失败（{e}），忽略")
+        elif args.config != parser.get_default('config'):
+            print(f"警告：配置文件不存在，忽略：{args.config}")
+
         cli_config = {
             'source_dir': str(Path(args.inputs[0]).parent.resolve()),
             'target_dir': output_dir,
             'log_file': 'music_converter.log',
             'log_level': 'INFO',
-            'threads': args.jobs or 4,
-            'decode_threads': args.threads or 4,
-            'embed_metadata': not args.no_meta,
+            'threads': args.jobs or file_cfg.get('threads') or 4,
+            'decode_threads': args.threads or file_cfg.get('decode_threads') or 4,
+            'embed_metadata': False if args.no_meta else file_cfg.get('embed_metadata', True),
+            'strip_padding': file_cfg.get('strip_padding', True),
         }
         config = cli_config
+        STRIP_FLAC_PADDING = (not args.keep_padding) and config['strip_padding']
 
         print(f"模式：命令行模式，共 {len(file_list)} 个文件")
         print(f"输出目录：{output_dir}")
         print(f"解码线程：{config['decode_threads']}")
-        print(f"元数据嵌入：{'否' if args.no_meta else '是'}")
+        print(f"元数据嵌入：{'是' if config['embed_metadata'] else '否'}")
         print(f"剔除 PADDING：{'是' if STRIP_FLAC_PADDING else '否'}")
 
         try:
