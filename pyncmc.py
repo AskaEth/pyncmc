@@ -63,6 +63,9 @@ NCM_OUTPUT_EXT = {'.flac', '.mp3'}
 # 分块大小
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
+# 默认剔除 FLAC 的 PADDING 元数据块（纯填充，无信息量；网易云用它把文件补齐到整 MiB）
+STRIP_FLAC_PADDING = True
+
 class NCMMetadata:
     """NCM 元数据解析器"""
     
@@ -372,6 +375,7 @@ class NCMDecoder:
         if not MUTAGEN_AVAILABLE:
             with open(output_path, 'wb') as f:
                 f.write(audio_data)
+            self.strip_padding_if_needed(audio_format, output_path)
             return
 
         temp_path = output_path.with_suffix(output_path.suffix + '.tmp')
@@ -395,6 +399,19 @@ class NCMDecoder:
         finally:
             if temp_path.exists():
                 temp_path.unlink()
+
+        self.strip_padding_if_needed(audio_format, output_path)
+
+    def strip_padding_if_needed(self, audio_format: str, output_path: Path):
+        """剔除 FLAC 的 PADDING 块（在标签写入之后，避免影响 mutagen 的原地改写）。"""
+        if not STRIP_FLAC_PADDING or audio_format != 'flac':
+            return
+        try:
+            removed = strip_flac_padding(output_path)
+            if removed > 0:
+                logging.info(f"剔除 PADDING：{removed} 字节")
+        except Exception as e:
+            logging.warning(f"剔除 PADDING 失败（保留原样）：{e}")
 
     
     def _embed_flac_metadata(self, temp_path: Path, output_path: Path):
@@ -482,6 +499,64 @@ class NCMDecoder:
         shutil.copy2(temp_path, output_path)
 
 
+def strip_flac_padding(path: Path) -> int:
+    """删除 FLAC 里的 PADDING 元数据块，返回省下的字节数。
+
+    PADDING 块体是纯填充（实测全零），删除它不影响解码；
+    但块头里的「最后一块」标志必须正确迁移，否则文件会损坏。
+    """
+    try:
+        with open(path, 'rb') as f:
+            if f.read(4) != b'fLaC':
+                return 0
+            blocks = []
+            audio_start = None
+            saw_padding = False
+            while True:
+                header = f.read(4)
+                if len(header) < 4:
+                    return 0
+                is_last = header[0] & 0x80
+                block_type = header[0] & 0x7f
+                length = int.from_bytes(header[1:4], 'big')
+                data = f.read(length)
+                if len(data) < length:
+                    return 0
+                if block_type == 1:
+                    saw_padding = True
+                else:
+                    blocks.append((block_type, data))
+                if is_last:
+                    audio_start = f.tell()
+                    break
+
+        if not saw_padding or audio_start is None or not blocks:
+            return 0
+
+        original = path.stat().st_size
+        tmp_path = path.with_suffix(path.suffix + '.nopad')
+        with open(path, 'rb') as src, open(tmp_path, 'wb') as dst:
+            dst.write(b'fLaC')
+            for idx, (block_type, data) in enumerate(blocks):
+                last_flag = 0x80 if idx == len(blocks) - 1 else 0
+                dst.write(bytes([block_type | last_flag]) + len(data).to_bytes(3, 'big'))
+                dst.write(data)
+            src.seek(audio_start)
+            shutil.copyfileobj(src, dst, CHUNK_SIZE)
+
+        new_size = tmp_path.stat().st_size
+        if new_size >= original:  # 没有可省的空间，保持原文件
+            tmp_path.unlink()
+            return 0
+        os.replace(tmp_path, path)
+        return original - new_size
+    except Exception:
+        leftover = path.with_suffix(path.suffix + '.nopad')
+        if leftover.exists():
+            leftover.unlink()
+        raise
+
+
 def load_config(config_path: str = "music_converter.conf") -> Dict:
     default_config = {
         'source_dir': './folderA',
@@ -491,6 +566,7 @@ def load_config(config_path: str = "music_converter.conf") -> Dict:
         'threads': '4',
         'decode_threads': '4',
         'embed_metadata': 'true',
+        'strip_padding': 'true',
     }
     
     config_path_obj = Path(config_path)
@@ -532,6 +608,7 @@ def load_config(config_path: str = "music_converter.conf") -> Dict:
         config['decode_threads'] = 4
     
     config['embed_metadata'] = config['embed_metadata'].lower() == 'true'
+    config['strip_padding'] = str(config.get('strip_padding', 'true')).lower() != 'false'
     
     return config
 
@@ -802,6 +879,7 @@ class FileProcessor:
             else:
                 with open(output_file, 'wb') as f:
                     f.write(audio_data)
+                decoder.strip_padding_if_needed(audio_format, output_file)
             
             current_time = time.time()
             os.utime(output_file, (current_time, current_time))
@@ -950,10 +1028,15 @@ def main():
                         help=f'文件并行处理数（默认：配置值或 4）')
     parser.add_argument('--no-meta', action='store_true',
                         help='不嵌入元数据（标题、艺人、封面）')
+    parser.add_argument('--keep-padding', action='store_true',
+                        help='保留 FLAC 的 PADDING 填充块（默认剔除）')
     parser.add_argument('-c', '--config', default='music_converter.conf',
                         help=f'配置文件路径（默认：music_converter.conf）')
 
     args = parser.parse_args()
+
+    global STRIP_FLAC_PADDING
+    STRIP_FLAC_PADDING = not args.keep_padding
 
     print_banner()
 
@@ -992,6 +1075,7 @@ def main():
         print(f"输出目录：{output_dir}")
         print(f"解码线程：{config['decode_threads']}")
         print(f"元数据嵌入：{'否' if args.no_meta else '是'}")
+        print(f"剔除 PADDING：{'是' if STRIP_FLAC_PADDING else '否'}")
 
         try:
             processor = FileProcessor(config,
@@ -1019,9 +1103,11 @@ def main():
                 config['threads'] = args.jobs
             if args.no_meta:
                 config['embed_metadata'] = False
+            STRIP_FLAC_PADDING = (not args.keep_padding) and config.get('strip_padding', True)
 
             processor = FileProcessor(config)
             processor.scan_and_process_files()
+            print(f"剔除 PADDING：{'是' if STRIP_FLAC_PADDING else '否'}")
             print("\n完成!")
         except KeyboardInterrupt:
             print("\n中断")
