@@ -287,6 +287,63 @@ class NCMDecoder:
         else:
             return None, offset + 4
 
+    # ── 音频起点探测（移植自 analyze_ncm.py 的多策略思路）──
+    SEP_STD = bytes([0x01, 0x63, 0x05, 0x00, 0x00])
+    SEP_VAR = bytes([0x01, 0x00, 0x00, 0x00, 0x00])
+
+    def _audio_format_at(self, data: bytes, offset: int) -> Optional[str]:
+        """在候选偏移处解密 16 字节，判断是否落在 FLAC/MP3 帧头。"""
+        if offset < 0 or offset + 4 > len(data):
+            return None
+        head = self._xor_decrypt_multithread(data[offset:offset + 16])
+        if head[:4] == b'fLaC':
+            return 'flac'
+        if head[:3] == b'ID3':
+            return 'mp3'
+        if len(head) > 1 and head[0] == 0xff and (head[1] & 0xe0) == 0xe0:
+            return 'mp3'
+        return None
+
+    def _candidate_cover_offsets(self, data: bytes, meta_end: int) -> List[Tuple[str, int]]:
+        """按 NCM 分隔符的常见变体，给出封面帧可能的起始位置（按优先级）。"""
+        cands = [('盲跳 9B', meta_end + 9)]
+        if data[meta_end + 4:meta_end + 9] == self.SEP_STD:
+            cands.append(('CRC32 + 标准分隔符', meta_end + 9))
+        if data[meta_end:meta_end + 5] == self.SEP_STD:
+            cands.append(('标准分隔符（无 CRC32）', meta_end + 5))
+        if data[meta_end + 4:meta_end + 9] == self.SEP_VAR:
+            cands.append(('CRC32 + 变体分隔符', meta_end + 9))
+        if data[meta_end:meta_end + 5] == self.SEP_VAR:
+            cands.append(('变体分隔符（无 CRC32）', meta_end + 5))
+        cands.append(('盲跳 5B', meta_end + 5))
+        cands.append(('盲跳 0B', meta_end))
+
+        seen, uniq = set(), []
+        for name, off in cands:
+            if off not in seen:
+                seen.add(off)
+                uniq.append((name, off))
+        return uniq
+
+    def _locate_audio(self, data: bytes, meta_end: int) -> Tuple[Optional[bytes], int, str]:
+        """返回 (封面, 音频起点, 采用的分隔符策略)。"""
+        for name, cover_pos in self._candidate_cover_offsets(data, meta_end):
+            if cover_pos < 0 or cover_pos >= len(data):
+                continue
+            try:
+                cover, audio_off = self._parse_cover(data, cover_pos)
+            except Exception:
+                continue
+            if audio_off >= len(data):
+                continue
+            if self._audio_format_at(data, audio_off):
+                return cover, audio_off, name
+
+        # 全部候选都不像音频头：退回旧行为（盲跳 9 字节）
+        fallback_pos = min(meta_end + 9, len(data))
+        cover, audio_off = self._parse_cover(data, fallback_pos)
+        return cover, audio_off, '盲跳 9B（回退）'
+
     
     def decode(self) -> Tuple[bytes, str, dict]:
         """解码 NCM 文件"""
@@ -339,14 +396,13 @@ class NCMDecoder:
         offset += meta_consumed
         self.metadata = self.metadata_parser.metadata
 
-        # 跳过 CRC32 (4字节) + 分隔符 (5字节) = 共 9 字节
-        if offset + 9 <= file_size:
-            offset += 9
-
-        cover_data, offset = self._parse_cover(data, offset)
+        # 定位封面与音频起点：先用历史上的「盲跳 9 字节」，失败则按分隔符变体逐一探测
+        cover_data, offset, strategy = self._locate_audio(data, offset)
         if cover_data:
             self.cover_data = cover_data
-        
+        if strategy not in ('盲跳 9B', '盲跳 9B（回退）'):
+            logging.info(f"音频起点探测：{strategy}")
+
         audio_data = data[offset:]
         
         if len(audio_data) == 0:

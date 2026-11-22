@@ -2,6 +2,13 @@
 
 NCM 文件解码为 FLAC/MP3，自动嵌入元数据和封面。
 
+## 特性
+
+- FLAC / MP3 解码，标题、艺人、专辑、歌词与封面自动写入
+- 音频起点自适应：NCM 的分隔符存在多种变体，解码前逐种探测并用帧头校验，不依赖固定偏移
+- 默认剔除 FLAC 的 `PADDING` 填充块（对齐用的全零块），可用 `--keep-padding` 保留
+- 支持单文件、多文件、目录、配置文件四种输入方式，多线程解码
+
 ## 安装依赖
 
 ```
@@ -42,6 +49,9 @@ python pyncmc.py song.ncm -o ~/Music/
 # 不嵌入元数据（只解码）
 python pyncmc.py song.ncm --no-meta
 
+# 保留 FLAC 的 PADDING 填充块（默认剔除）
+python pyncmc.py song.ncm --keep-padding
+
 # 自定义线程数
 python pyncmc.py song.ncm -t 8 -j 4
 ```
@@ -63,8 +73,11 @@ target_dir = /path/to/output/
 threads = 8
 decode_threads = 8
 embed_metadata = true
+strip_padding = true
 log_level = INFO
 ```
+
+`strip_padding = false` 可保留填充块；命令行下的等价开关是 `--keep-padding`。
 
 ### 选项
 
@@ -75,6 +88,7 @@ log_level = INFO
 | `-t`, `--threads` | 单文件解码线程数（默认 4） |
 | `-j`, `--jobs` | 文件并行处理数（默认 4） |
 | `--no-meta` | 不嵌入元数据 |
+| `--keep-padding` | 保留 FLAC 的 `PADDING` 填充块（默认剔除；块体为全零，仅用于对齐文件大小）|
 | `-c`, `--config` | 配置文件路径（默认 music_converter.conf） |
 
 ---
